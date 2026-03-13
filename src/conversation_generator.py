@@ -1,46 +1,24 @@
-import os
 import random
 import re
 from typing import Dict, Optional
 
-from openai.types.chat import ChatCompletionMessageParam
-
-from config import PERSONAS, create_client, logger
+from config import PERSONAS, logger
+from opencode_client import call_opencode, serialize_conversation
 from user_simulator import UserSimulator
 
 
 class ConversationGenerator:
-    """Generates debugging conversations in OpenAI format with synthetic user interactions."""
+    """Generates debugging conversations with synthetic user interactions."""
 
-    def __init__(
-        self,
-        api_key: Optional[str] = None,
-        base_url: Optional[str] = None,
-        model: Optional[str] = None,
-    ):
-        """Initialize the conversation generator with assistant model."""
-        resolved_model = model or os.getenv("ASSISTANT_MODEL")
-        if not resolved_model:
-            raise ValueError(
-                "No model specified. Set ASSISTANT_MODEL env var or pass model parameter."
-            )
-        self.model: str = resolved_model
+    def __init__(self, attach_url: str, model: Optional[str] = None):
+        """Initialize the conversation generator with opencode attach URL."""
+        self.attach_url = attach_url
+        self.model = model or "opencode/minimax-m2.5-free"
 
-        try:
-            self.client = create_client("assistant")
-        except Exception as e:
-            logger.error(f"Error initializing conversation generator client: {e}")
-            raise
-
-        # Initialize user simulator
-        try:
-            self.user_simulator = UserSimulator()
-            logger.success(
-                f"User simulator initialized (model: {self.user_simulator.model_name})"
-            )
-        except Exception as e:
-            logger.warning(f"Failed to initialize user simulator: {e}")
-            self.user_simulator = None
+        self.user_simulator = UserSimulator(attach_url=attach_url)
+        logger.success(
+            f"ConversationGenerator initialized (attach_url: {self.attach_url})"
+        )
 
     def _normalize_persona(self, persona):
         """Convert persona string to dict format if needed."""
@@ -137,9 +115,9 @@ Be authentic to your persona level. Use CODE_HERE as placeholder for code placem
     # Single-turn conversation
     # ------------------------------------------------------------------
 
-    def generate_single_turn_synthetic(
+    async def generate_single_turn_synthetic(
         self, bug_data: Dict, persona: Optional[str] = None
-    ) -> list[ChatCompletionMessageParam]:
+    ) -> list[dict]:
         """
         Generate a single-turn conversation: user presents bug -> assistant fixes it.
 
@@ -148,7 +126,7 @@ Be authentic to your persona level. Use CODE_HERE as placeholder for code placem
             persona: User persona (beginner/intermediate/advanced)
 
         Returns:
-            List of messages in OpenAI format [user, assistant]
+            List of messages [user, assistant]
         """
         persona_info = self._normalize_persona(persona)
 
@@ -168,22 +146,16 @@ Be authentic to your persona level. Use CODE_HERE as placeholder for code placem
 
         # Two-step generation with CODE_HERE placeholder
         try:
-            if self.user_simulator:
-                logger.debug(
-                    f"Calling user simulator (model: {self.user_simulator.model_name})..."
+            logger.debug("Calling user simulator...")
+            description = await self.user_simulator._call_model(
+                user_system_prompt, user_prompt_instruction
+            )
+            if description:
+                user_prompt = self._process_user_simulator_response(
+                    description, buggy_code
                 )
-                description = self.user_simulator._call_model(
-                    user_system_prompt, user_prompt_instruction
-                )
-                if description:
-                    user_prompt = self._process_user_simulator_response(
-                        description, buggy_code
-                    )
-                else:
-                    logger.warning("User simulator returned empty, using fallback")
-                    user_prompt = f"I'm getting this TypeScript error: {expected_errors}\n\nHere's my code:\n\n```typescript\n{buggy_code}\n```\n\nCan you help me fix it?"
             else:
-                logger.warning("User simulator not available, using fallback")
+                logger.warning("User simulator returned empty, using fallback")
                 user_prompt = f"I'm getting this TypeScript error: {expected_errors}\n\nHere's my code:\n\n```typescript\n{buggy_code}\n```\n\nCan you help me fix it?"
         except Exception as e:
             logger.error(f"Error generating user prompt: {e}")
@@ -200,18 +172,15 @@ When a user presents buggy code:
 Always provide working, corrected code."""
 
         try:
-            api_messages: list[ChatCompletionMessageParam] = [
-                {"role": "system", "content": assistant_system_prompt},
-                {"role": "user", "content": user_prompt},
-            ]
-            assistant_response = self.client.chat.completions.create(
-                model=self.model,
-                messages=api_messages,
+            system_for_serialize, user_for_serialize = serialize_conversation(
+                assistant_system_prompt,
+                [{"role": "user", "content": user_prompt}],
             )
-
-            assistant_message = (
-                assistant_response.choices[0].message.content or ""
-            ).strip()
+            assistant_message = await call_opencode(
+                system_prompt=system_for_serialize,
+                user_prompt=user_for_serialize,
+                attach_url=self.attach_url,
+            )
 
             if not assistant_message:
                 assistant_message = "I'll help you fix these TypeScript errors. [Error: No response generated]"
@@ -235,12 +204,12 @@ Always provide working, corrected code."""
     # Multi-turn conversation
     # ------------------------------------------------------------------
 
-    def generate_multi_turn_synthetic(
+    async def generate_multi_turn_synthetic(
         self,
         bug_data: Dict,
         persona: Optional[str] = None,
         num_turns: Optional[int] = None,
-    ) -> list[ChatCompletionMessageParam]:
+    ) -> list[dict]:
         """
         Generate a multi-turn verification-based conversation.
         User presents bug -> Assistant fixes -> User verifies -> Continue if issues found.
@@ -251,7 +220,7 @@ Always provide working, corrected code."""
             num_turns: Target number of complete turns (2-6)
 
         Returns:
-            List of messages in OpenAI format [user, assistant, user, assistant, ...]
+            List of messages [user, assistant, user, assistant, ...]
         """
         persona_info = self._normalize_persona(persona)
 
@@ -268,7 +237,7 @@ Always provide working, corrected code."""
         else:
             expected_errors = bug_data.get("expected_error", "TypeScript error")
 
-        messages: list[ChatCompletionMessageParam] = []
+        messages: list[dict] = []
 
         try:
             # === TURN 1: User presents bug ===
@@ -278,22 +247,16 @@ Always provide working, corrected code."""
                 )
             )
 
-            if self.user_simulator:
-                logger.debug(
-                    f"Calling user simulator (model: {self.user_simulator.model_name})..."
+            logger.debug("Calling user simulator...")
+            description = await self.user_simulator._call_model(
+                user_system_prompt, user_prompt_instruction
+            )
+            if description:
+                user_msg_1 = self._process_user_simulator_response(
+                    description, buggy_code
                 )
-                description = self.user_simulator._call_model(
-                    user_system_prompt, user_prompt_instruction
-                )
-                if description:
-                    user_msg_1 = self._process_user_simulator_response(
-                        description, buggy_code
-                    )
-                else:
-                    logger.warning("User simulator returned empty, using fallback")
-                    user_msg_1 = f"I'm getting this error: {expected_errors}\n\nHere's my code:\n\n```typescript\n{buggy_code}\n```\n\nCan you help?"
             else:
-                logger.warning("User simulator not available, using fallback")
+                logger.warning("User simulator returned empty, using fallback")
                 user_msg_1 = f"I'm getting this error: {expected_errors}\n\nHere's my code:\n\n```typescript\n{buggy_code}\n```\n\nCan you help?"
 
             messages.append({"role": "user", "content": user_msg_1})
@@ -309,18 +272,14 @@ When a user presents buggy code:
 
 Always provide working, corrected code."""
 
-            system_msg: list[ChatCompletionMessageParam] = [
-                {"role": "system", "content": assistant_system_prompt}
-            ]
-            assistant_msg_1 = (
-                self.client.chat.completions.create(
-                    model=self.model,
-                    messages=system_msg + messages,
-                    )
-                .choices[0]
-                .message.content
-                or ""
-            ).strip()
+            sys_prompt, user_prompt = serialize_conversation(
+                assistant_system_prompt, messages
+            )
+            assistant_msg_1 = await call_opencode(
+                system_prompt=sys_prompt,
+                user_prompt=user_prompt,
+                attach_url=self.attach_url,
+            )
 
             if not assistant_msg_1:
                 assistant_msg_1 = "Let me help you fix these TypeScript errors."
@@ -330,31 +289,18 @@ Always provide working, corrected code."""
             # === FOLLOW-UP TURNS ===
             for turn_num in range(2, num_turns + 1):
                 try:
-                    if self.user_simulator:
-                        logger.debug(
-                            f"Calling user simulator for follow-up (turn {turn_num})..."
-                        )
-                        user_followup = self.user_simulator.generate_followup(
-                            conversation_history=messages,
-                            persona=persona_info["persona"],
-                            intent=None,
-                        )
-                        if user_followup:
-                            logger.debug("User simulator follow-up received")
-                        else:
-                            logger.debug("User satisfied with the answer")
+                    logger.debug(
+                        f"Calling user simulator for follow-up (turn {turn_num})..."
+                    )
+                    user_followup = await self.user_simulator.generate_followup(
+                        conversation_history=messages,
+                        persona=persona_info["persona"],
+                        intent=None,
+                    )
+                    if user_followup:
+                        logger.debug("User simulator follow-up received")
                     else:
-                        logger.warning(
-                            "User simulator not available for follow-up, using fallback"
-                        )
-                        fallbacks = [
-                            "Can you explain that part again?",
-                            "I'm not sure I understand why that fixes it.",
-                            "What about edge cases?",
-                            "Is there an alternative approach?",
-                            "Thanks! How would this handle null values?",
-                        ]
-                        user_followup = random.choice(fallbacks)
+                        logger.debug("User satisfied with the answer")
 
                     if not user_followup or len(user_followup) < 10:
                         if not user_followup:
@@ -365,15 +311,14 @@ Always provide working, corrected code."""
 
                     messages.append({"role": "user", "content": user_followup})
 
-                    assistant_followup = (
-                        self.client.chat.completions.create(
-                            model=self.model,
-                            messages=system_msg + messages,
-                                    )
-                        .choices[0]
-                        .message.content
-                        or ""
-                    ).strip()
+                    sys_prompt, user_prompt = serialize_conversation(
+                        assistant_system_prompt, messages
+                    )
+                    assistant_followup = await call_opencode(
+                        system_prompt=sys_prompt,
+                        user_prompt=user_prompt,
+                        attach_url=self.attach_url,
+                    )
 
                     if not assistant_followup:
                         assistant_followup = "Let me clarify that for you."
@@ -422,12 +367,12 @@ Always provide working, corrected code."""
     # Code generation conversation
     # ------------------------------------------------------------------
 
-    def generate_code_generation_conversation(
+    async def generate_code_generation_conversation(
         self,
         generated_code_data: Dict,
         persona: Optional[str] = None,
         num_turns: Optional[int] = None,
-    ) -> list[ChatCompletionMessageParam]:
+    ) -> list[dict]:
         """
         Generate a conversation about TypeScript code generation.
         User asks for code to be written, assistant generates it, user may ask for modifications.
@@ -438,7 +383,7 @@ Always provide working, corrected code."""
             num_turns: Target number of turns
 
         Returns:
-            List of messages in OpenAI format
+            List of messages
         """
         if persona is None:
             persona = random.choice(["beginner", "intermediate", "advanced"])
@@ -450,7 +395,7 @@ Always provide working, corrected code."""
         task_kind = generated_code_data.get("task_kind", "utility functions")
         generated_code = generated_code_data.get("code", "")
 
-        messages: list[ChatCompletionMessageParam] = []
+        messages: list[dict] = []
 
         try:
             generation_prompts = [
@@ -490,28 +435,25 @@ This code {generated_code_data.get("description", "implements the requested func
 
                 for turn_num in range(num_turns - 2):
                     try:
-                        if self.user_simulator:
-                            user_followup = self.user_simulator.generate_followup(
-                                conversation_history=messages,
-                                persona=persona,
-                                intent=random.choice(followup_intents),
-                            )
-                            if not user_followup:
-                                logger.debug("Code gen conversation naturally concluded")
-                                break
-                        else:
-                            user_followup = "Can you explain how this works?"
+                        user_followup = await self.user_simulator.generate_followup(
+                            conversation_history=messages,
+                            persona=persona,
+                            intent=random.choice(followup_intents),
+                        )
+                        if not user_followup:
+                            logger.debug("Code gen conversation naturally concluded")
+                            break
 
                         messages.append({"role": "user", "content": user_followup})
 
-                        sys_msg: list[ChatCompletionMessageParam] = [
-                            {"role": "system", "content": system_prompt}
-                        ]
-                        response = self.client.chat.completions.create(
-                            model=self.model,
-                            messages=sys_msg + messages,
-                                    )
-                        assistant_response = response.choices[0].message.content or ""
+                        sys_prompt, u_prompt = serialize_conversation(
+                            system_prompt, messages
+                        )
+                        assistant_response = await call_opencode(
+                            system_prompt=sys_prompt,
+                            user_prompt=u_prompt,
+                            attach_url=self.attach_url,
+                        )
                         messages.append(
                             {"role": "assistant", "content": assistant_response}
                         )

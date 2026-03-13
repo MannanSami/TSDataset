@@ -12,3 +12,9 @@ wheels/
 
 # Environment variables
 .env
+
+# Generated output
+output/
+
+# Misc
+sortByKeys.ts

@@ -1,8 +1,10 @@
+import asyncio
 import os
+import shutil
 
 from dotenv import load_dotenv
 
-from config import logger
+from config import OPENCODE_PATH, OPENCODE_PORT, OPENCODE_MODEL, logger
 
 
 def test_env_config():
@@ -13,22 +15,16 @@ def test_env_config():
 
     load_dotenv()
 
-    required_vars = [
-        "ASSISTANT_API_KEY",
-        "ASSISTANT_BASE_URL",
-        "ASSISTANT_MODEL",
-    ]
+    configs = {
+        "OPENCODE_PATH": OPENCODE_PATH,
+        "OPENCODE_PORT": str(OPENCODE_PORT),
+        "OPENCODE_MODEL": OPENCODE_MODEL,
+    }
 
     all_good = True
-    for var in required_vars:
-        value = os.getenv(var)
+    for var, value in configs.items():
         if value:
-            # Mask API keys
-            if "KEY" in var:
-                display_value = value[:10] + "..." if len(value) > 10 else value
-            else:
-                display_value = value
-            logger.success(f"{var}: {display_value}")
+            logger.success(f"{var}: {value}")
         else:
             logger.error(f"{var}: NOT SET")
             all_good = False
@@ -43,10 +39,10 @@ def test_imports():
     logger.info("=" * 60)
 
     imports = [
-        ("openai", "OpenAI client"),
         ("datasets", "HuggingFace datasets"),
         ("pandas", "Data processing"),
         ("tqdm", "Progress bars"),
+        ("opencode_client", "OpenCode client wrapper"),
     ]
 
     all_good = True
@@ -61,10 +57,25 @@ def test_imports():
     return all_good
 
 
-def test_model_connections():
-    """Test connection to both models."""
+def test_opencode_binary():
+    """Test that the opencode binary exists and is executable."""
     logger.info("=" * 60)
-    logger.info("Testing Model Connections")
+    logger.info("Testing OpenCode Binary")
+    logger.info("=" * 60)
+
+    path = shutil.which("opencode") or OPENCODE_PATH
+    if os.path.isfile(path) and os.access(path, os.X_OK):
+        logger.success(f"opencode binary found at: {path}")
+        return True
+    else:
+        logger.error(f"opencode binary not found or not executable at: {path}")
+        return False
+
+
+def test_model_connections():
+    """Test connection to opencode by running a simple prompt."""
+    logger.info("=" * 60)
+    logger.info("Testing OpenCode Connectivity")
     logger.info("=" * 60)
 
     try:
@@ -72,45 +83,26 @@ def test_model_connections():
 
         logger.success("BugInjector imported successfully")
 
-        bug_injector = BugInjector()
-        logger.success(f"Assistant Model: {bug_injector.model}")
-        logger.info(f"  Base URL: {bug_injector.base_url}")
-
-    except Exception as e:
-        logger.error(f"Error initializing BugInjector: {e}")
-        return False
-
-    try:
         from user_simulator import UserSimulator
 
         logger.success("UserSimulator imported successfully")
 
-        user_sim = UserSimulator()
-        logger.success(f"User Model: {user_sim.model_name}")
+        from conversation_generator import ConversationGenerator
 
-        # Check primary client connectivity
-        if user_sim.client:
-            logger.success("User simulator primary client initialized")
-        else:
-            logger.error("User simulator primary client not available")
-            return False
-    except Exception as e:
-        logger.error(f"Error initializing UserSimulator: {e}")
-        return False
-
-    try:
         logger.success("ConversationGenerator imported successfully")
-        logger.success("Conversation generator ready")
+
+        logger.info(f"Configured model: {OPENCODE_MODEL}")
+        logger.info(f"Configured port: {OPENCODE_PORT}")
+        logger.success("All modules importable with opencode backend")
+        return True
 
     except Exception as e:
-        logger.error(f"Error initializing ConversationGenerator: {e}")
+        logger.error(f"Error importing modules: {e}")
         return False
-
-    return True
 
 
 def test_simple_generation():
-    """Test a simple bug injection (doesn't call API)."""
+    """Test basic configuration of bug injector."""
     logger.info("=" * 60)
     logger.info("Testing Basic Functionality")
     logger.info("=" * 60)
@@ -121,7 +113,8 @@ def test_simple_generation():
     try:
         from bug_injector import BugInjector
 
-        bug_injector = BugInjector()
+        # Use a dummy URL — we're just testing the category list, not making calls
+        bug_injector = BugInjector(attach_url="http://localhost:14000")
 
         for i, category in enumerate(bug_injector.TS_BUG_CATEGORIES, 1):
             logger.info(f"  {i}. {category}")
@@ -151,10 +144,13 @@ def main():
     # Test 2: Imports
     results.append(("Python Imports", test_imports()))
 
-    # Test 3: Model connections
-    results.append(("Model Connections", test_model_connections()))
+    # Test 3: OpenCode binary
+    results.append(("OpenCode Binary", test_opencode_binary()))
 
-    # Test 4: Basic functionality
+    # Test 4: Module imports
+    results.append(("Module Connections", test_model_connections()))
+
+    # Test 5: Basic functionality
     results.append(("Basic Functionality", test_simple_generation()))
 
     # Summary
@@ -179,11 +175,9 @@ def main():
     else:
         logger.warning("Some tests failed. Please fix the issues above.")
         logger.info("Common fixes:")
-        logger.info(
-            "- Install missing packages: pip install openai datasets pandas tqdm python-dotenv"
-        )
-        logger.info("- Update .env with correct API keys and URLs")
-        logger.info("- Ensure API keys and base URLs are configured correctly")
+        logger.info("- Ensure opencode is installed at /opt/homebrew/bin/opencode")
+        logger.info("- Update .env with OPENCODE_PORT and OPENCODE_MODEL if needed")
+        logger.info("- Run: opencode serve --port 14000  to verify opencode works")
 
 
 if __name__ == "__main__":

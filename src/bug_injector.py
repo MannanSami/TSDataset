@@ -2,7 +2,8 @@ import json
 import os
 from typing import Dict, Optional
 
-from config import create_client, extract_json_from_response, logger
+from config import extract_json_from_response, logger
+from opencode_client import call_opencode
 
 
 class BugInjector:
@@ -21,28 +22,13 @@ class BugInjector:
         "optional-property",
     ]
 
-    def __init__(
-        self,
-        api_key: Optional[str] = None,
-        base_url: Optional[str] = None,
-        model: Optional[str] = None,
-    ):
-        """Initialize the bug injector with OpenAI client."""
-        resolved_model = model or os.getenv("ASSISTANT_MODEL")
-        if not resolved_model:
-            raise ValueError(
-                "No model specified. Set ASSISTANT_MODEL env var or pass model parameter."
-            )
-        self.model: str = resolved_model
+    def __init__(self, attach_url: str, model: Optional[str] = None):
+        """Initialize the bug injector with opencode attach URL."""
+        self.attach_url = attach_url
+        self.model = model or os.getenv("ASSISTANT_MODEL", "opencode/minimax-m2.5-free")
+        logger.info(f"BugInjector initialized (model: {self.model})")
 
-        try:
-            self.client = create_client("assistant")
-            self.base_url = self.client.base_url
-        except Exception as e:
-            logger.error(f"Error initializing bug injector client: {e}")
-            raise
-
-    def inject_bug(
+    async def inject_bug(
         self, clean_code: str, bug_category: Optional[str] = None
     ) -> Dict[str, str]:
         """
@@ -86,18 +72,11 @@ Return your response in this EXACT JSON format (no markdown, just raw JSON):
         content = ""
 
         try:
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": "You are a helpful assistant that introduces specific TypeScript bugs. Always respond with valid JSON only.",
-                    },
-                    {"role": "user", "content": prompt},
-                ],
+            content = await call_opencode(
+                system_prompt="You are a helpful assistant that introduces specific TypeScript bugs. Always respond with valid JSON only.",
+                user_prompt=prompt,
+                attach_url=self.attach_url,
             )
-
-            content = (response.choices[0].message.content or "").strip()
             content = extract_json_from_response(content)
 
             result = json.loads(content)
@@ -127,7 +106,7 @@ Return your response in this EXACT JSON format (no markdown, just raw JSON):
                 "bug_category": bug_category,
             }
 
-    def inject_multiple_bugs(
+    async def inject_multiple_bugs(
         self, clean_code: str, num_bugs: int = 2, bug_categories: Optional[list] = None
     ) -> Dict:
         """
@@ -189,18 +168,11 @@ Return your response in this EXACT JSON format (no markdown, just raw JSON):
 }}"""
 
         try:
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": "You are a helpful assistant that introduces specific TypeScript bugs. Always respond with valid JSON only.",
-                    },
-                    {"role": "user", "content": prompt},
-                ],
+            content = await call_opencode(
+                system_prompt="You are a helpful assistant that introduces specific TypeScript bugs. Always respond with valid JSON only.",
+                user_prompt=prompt,
+                attach_url=self.attach_url,
             )
-
-            content = (response.choices[0].message.content or "").strip()
             content = extract_json_from_response(content)
 
             result = json.loads(content)
@@ -217,13 +189,12 @@ Return your response in this EXACT JSON format (no markdown, just raw JSON):
 
         except json.JSONDecodeError as e:
             logger.error(f"JSON decode error in multiple bug injection: {e}")
-            # Fallback to single bug
-            return self._fallback_multiple_bugs(clean_code, num_bugs, bug_categories)
+            return await self._fallback_multiple_bugs(clean_code, num_bugs, bug_categories)
         except Exception as e:
             logger.error(f"Error in multiple bug injection: {e}")
-            return self._fallback_multiple_bugs(clean_code, num_bugs, bug_categories)
+            return await self._fallback_multiple_bugs(clean_code, num_bugs, bug_categories)
 
-    def generate_typescript_code(self, task_kind: str = "utility functions") -> Dict:
+    async def generate_typescript_code(self, task_kind: str = "utility functions") -> Dict:
         """
         Generate TypeScript code for a dynamically created task.
 
@@ -257,18 +228,11 @@ Return your response in this EXACT JSON format (no markdown, just raw JSON):
 }}"""
 
         try:
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": "You are an expert TypeScript developer. Always respond with valid JSON only.",
-                    },
-                    {"role": "user", "content": prompt},
-                ],
+            content = await call_opencode(
+                system_prompt="You are an expert TypeScript developer. Always respond with valid JSON only.",
+                user_prompt=prompt,
+                attach_url=self.attach_url,
             )
-
-            content = (response.choices[0].message.content or "").strip()
             content = extract_json_from_response(content)
 
             result = json.loads(content)
@@ -302,7 +266,7 @@ Return your response in this EXACT JSON format (no markdown, just raw JSON):
                 "task_kind": task_kind,
             }
 
-    def _fallback_multiple_bugs(
+    async def _fallback_multiple_bugs(
         self, clean_code: str, num_bugs: int, bug_categories: list
     ) -> Dict:
         """Fallback when multiple bug injection fails - try single bugs sequentially."""
@@ -312,7 +276,7 @@ Return your response in this EXACT JSON format (no markdown, just raw JSON):
 
         for i, category in enumerate(bug_categories[:num_bugs]):
             try:
-                bug_result = self.inject_bug(current_code, category)
+                bug_result = await self.inject_bug(current_code, category)
                 if bug_result["buggy_code"] != current_code:
                     current_code = bug_result["buggy_code"]
                     all_bugs.append(

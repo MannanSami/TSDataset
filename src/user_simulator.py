@@ -1,44 +1,23 @@
-import os
 import random
 import re
-from typing import List, Optional
+from typing import Optional
 
-from openai.types.chat import ChatCompletionMessageParam
-
-from config import PERSONAS, create_client, logger
+from config import PERSONAS, logger
+from opencode_client import call_opencode
 
 
 class UserSimulator:
     """Simulates user interactions with different personas and skill levels."""
 
-    def __init__(self, model: Optional[str] = None):
-        """Initialize the user simulator with primary and fallback clients."""
-        self.model_name = model or os.getenv("ASSISTANT_MODEL", "kimi-k2.5")
-
-        # Initialize attributes
-        self.client = None
-        self.fallback_client = None
-        self.fallback_model = None
-
-        try:
-            self.client = create_client("assistant")
-            logger.info(f"UserSimulator initialized (model: {self.model_name})")
-
-            qwen_model = os.getenv("USER_FALLBACK_MODEL", "unsloth/Qwen3-14B-GGUF:Q8_0")
-            self.fallback_client = create_client("user")
-            self.fallback_model = qwen_model
-            qwen_base_url = os.getenv("USER_BASE_URL", "http://0.0.0.0:8000/v1")
-            logger.info(f"Fallback Qwen model initialized: {qwen_model} at {qwen_base_url}")
-        except Exception as e:
-            logger.warning(f"Could not initialize user simulator: {e}")
-            if self.client is None:
-                logger.warning("Primary client failed to initialize")
-            if self.fallback_client is None:
-                logger.warning("Fallback client failed to initialize")
+    def __init__(self, attach_url: str, model: Optional[str] = None):
+        """Initialize the user simulator with opencode attach URL."""
+        self.attach_url = attach_url
+        self.model_name = model or "opencode/minimax-m2.5-free"
+        logger.info(f"UserSimulator initialized (attach_url: {self.attach_url})")
 
     @staticmethod
     def _strip_think_tags(text: str) -> str:
-        """Remove <think></think> tags from Qwen3 model output."""
+        """Remove <think></think> tags from model output."""
         if not text:
             return text
         cleaned = re.sub(
@@ -47,63 +26,27 @@ class UserSimulator:
         cleaned = re.sub(r"\n\s*\n\s*\n", "\n\n", cleaned)
         return cleaned.strip()
 
-    def _call_model(
+    async def _call_model(
         self,
         system_prompt: str,
         user_prompt: str,
-        timeout: int = 60,
-        max_retries: int = 2,
+        timeout: int = 180,
+        max_retries: int = 3,
     ) -> Optional[str]:
-        """Call the primary model to generate a response with retries, then fall back to Qwen."""
-
-        if not self.client:
-            logger.warning("Primary client not initialized, skipping to fallback")
-        else:
-            for attempt in range(max_retries):
-                try:
-                    result = self.client.chat.completions.create(
-                        model=self.model_name,
-                        messages=[
-                            {"role": "system", "content": system_prompt},
-                            {"role": "user", "content": user_prompt},
-                        ],
-                    )
-                    output = (result.choices[0].message.content or "").strip()
-                    output = self._strip_think_tags(output)
-                    return output
-                except Exception as e:
-                    logger.error(
-                        f"Primary model attempt {attempt + 1}/{max_retries} error: {e}"
-                    )
-
-        # Fall back to local Qwen model
-        if self.fallback_client and self.fallback_model:
-            logger.debug(f"Falling back to local Qwen model: {self.fallback_model}")
-            try:
-                response = self.fallback_client.chat.completions.create(
-                    model=self.fallback_model,
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_prompt},
-                    ],
-                    temperature=1.0,
-                    top_p=0.95,
-                    frequency_penalty=0.3,
-                    presence_penalty=0.3,
-                )
-                output = (response.choices[0].message.content or "").strip()
-                if output:
-                    output = self._strip_think_tags(output)
-                    logger.success("Fallback Qwen model succeeded")
-                    return output
-            except Exception as e:
-                logger.error(f"Fallback Qwen error: {e}")
-        else:
-            logger.warning(
-                f"Fallback Qwen not available (client: {self.fallback_client is not None}, model: {self.fallback_model})"
+        """Call opencode to generate a response with retries."""
+        try:
+            output = await call_opencode(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                attach_url=self.attach_url,
+                timeout=timeout,
+                max_retries=max_retries,
             )
-
-        return None
+            output = self._strip_think_tags(output)
+            return output
+        except Exception as e:
+            logger.error(f"Model call failed: {e}")
+            return None
 
     def _get_persona_context(self, persona: str) -> str:
         """Get the context description for a persona."""
@@ -113,7 +56,7 @@ class UserSimulator:
             context += f"- {trait}\n"
         return context
 
-    def generate_initial_prompt(
+    async def generate_initial_prompt(
         self,
         code: str,
         scenario: str = "bug_fixing",
@@ -167,15 +110,15 @@ TypeScript code:
 
 Generate the user's message:"""
 
-        response = self._call_model(system_prompt, user_prompt)
+        response = await self._call_model(system_prompt, user_prompt)
         if response:
             return response
 
         return self._fallback_prompt(code, scenario, persona)
 
-    def generate_followup(
+    async def generate_followup(
         self,
-        conversation_history: List[ChatCompletionMessageParam],
+        conversation_history: list[dict],
         persona: str = "intermediate",
         intent: Optional[str] = None,
     ) -> str | None:
@@ -282,7 +225,7 @@ Generate your next message as the user.
 If the assistant has fully resolved your issue and explained everything clearly, and you have no more questions, output "CONVERSATION_END".
 Otherwise, generate your next natural message:"""
 
-        response = self._call_model(system_prompt, user_prompt, timeout=60)
+        response = await self._call_model(system_prompt, user_prompt)
         if response:
             # Hardened CONVERSATION_END detection (Phase 3.4)
             if "CONVERSATION_END" in response.strip().upper():

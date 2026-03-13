@@ -3,7 +3,6 @@ import re
 from typing import Dict, List
 
 from loguru import logger
-from openai import OpenAI
 from tqdm import tqdm
 
 logger.remove()
@@ -30,6 +29,12 @@ logger.add(
 
 # "/media/milab-7/TS_dedup"
 DEFAULT_DATASET_PATH = "/Users/mohammadabdulmannansami/Documents/CM/data"
+
+# OpenCode configuration
+OPENCODE_PATH = os.getenv("OPENCODE_PATH", "/opt/homebrew/bin/opencode")
+OPENCODE_PORT = int(os.getenv("OPENCODE_PORT", "14000"))
+OPENCODE_MODEL = os.getenv("OPENCODE_MODEL", "opencode/minimax-m2.5-free")
+MAX_CONCURRENT_SESSIONS = int(os.getenv("MAX_CONCURRENT_SESSIONS", "5"))
 
 PERSONAS: Dict[str, Dict] = {
     "beginner": {
@@ -72,26 +77,6 @@ PERSONAS: Dict[str, Dict] = {
         ],
     },
 }
-
-
-def create_client(role: str = "assistant") -> OpenAI:
-    """
-    Create an OpenAI-compatible client for the given role.
-
-    Args:
-        role: "assistant" for the main model, "user" for the user-simulation fallback (Qwen).
-
-    Returns:
-        An OpenAI client instance.
-    """
-    if role == "user":
-        api_key = os.getenv("USER_API_KEY", "not-needed")
-        base_url = os.getenv("USER_BASE_URL", "http://0.0.0.0:8000/v1")
-    else:
-        api_key = os.getenv("ASSISTANT_API_KEY", os.getenv("API_KEY"))
-        base_url = os.getenv("ASSISTANT_BASE_URL", os.getenv("BASE_URL"))
-
-    return OpenAI(api_key=api_key, base_url=base_url)
 
 
 def extract_json_from_response(content: str) -> str:

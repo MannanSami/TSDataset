@@ -1,3 +1,4 @@
+import asyncio
 import json
 import os
 import random
@@ -8,8 +9,14 @@ from dotenv import load_dotenv
 from tqdm import tqdm
 
 from bug_injector import BugInjector
-from config import DEFAULT_DATASET_PATH, logger
+from config import (
+    DEFAULT_DATASET_PATH,
+    MAX_CONCURRENT_SESSIONS,
+    OPENCODE_PORT,
+    logger,
+)
 from conversation_generator import ConversationGenerator
+from opencode_client import OpenCodeServer
 from validators import (
     compute_quality_score,
     validate_bug_fixing_sample,
@@ -35,7 +42,234 @@ CODE_GENERATION_TASK_KINDS = [
 ]
 
 
-def generate_samples(
+async def process_single_sample(
+    idx: int,
+    n_samples: int,
+    dataset,
+    bug_injector: BugInjector,
+    conversation_gen: ConversationGenerator,
+    is_code_gen: bool,
+    is_multi_turn: bool,
+    is_multi_bug: bool,
+    persona: str,
+    max_retries: int = 3,
+) -> dict | None:
+    """Process a single sample and return the data entry, or None on failure.
+
+    Retries up to max_retries times on transient failures (e.g. LLM call errors).
+    """
+    tag = f"S{idx}"
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            result = await _process_single_sample_attempt(
+                idx, n_samples, dataset, bug_injector, conversation_gen,
+                is_code_gen, is_multi_turn, is_multi_bug, persona, tag, attempt,
+            )
+            if result is not None:
+                return result
+        except Exception as e:
+            logger.error(f"[{tag}] Attempt {attempt}/{max_retries} raised: {e}")
+        if attempt < max_retries:
+            wait = 2 ** attempt
+            logger.warning(f"[{tag}] Attempt {attempt}/{max_retries} failed, retrying in {wait}s...")
+            await asyncio.sleep(wait)
+
+    logger.error(f"[{tag}] All {max_retries} attempts failed, skipping sample")
+    return None
+
+
+async def _process_single_sample_attempt(
+    idx, n_samples, dataset, bug_injector, conversation_gen,
+    is_code_gen, is_multi_turn, is_multi_bug, persona, tag, attempt,
+) -> dict | None:
+    """Single attempt at processing a sample. Returns None on failure."""
+
+    logger.info(f"[{tag}] Processing (index {idx}, attempt {attempt})")
+
+    if is_code_gen:
+        # CODE GENERATION SCENARIO
+        logger.info(
+            f"[{tag}] Type: Code Generation ({'Multi' if is_multi_turn else 'Single'}-turn)"
+        )
+        logger.info(f"[{tag}] Persona: {persona}")
+
+        task_kind = random.choice(CODE_GENERATION_TASK_KINDS)
+
+        logger.info(f"[{tag}] Step 1: Generating TypeScript code ({task_kind})...")
+
+        try:
+            code_data = await bug_injector.generate_typescript_code(task_kind)
+
+            if "Failed" in code_data["code"]:
+                logger.warning(f"[{tag}] Code generation failed, skipping sample...")
+                return None
+
+            logger.success(f"[{tag}] Code generated ({len(code_data['code'])} chars)")
+        except Exception as e:
+            logger.error(f"[{tag}] Error generating code: {e}")
+            return None
+
+        logger.info(f"[{tag}] Step 2: Generating conversation...")
+        try:
+            num_turns = random.randint(2, 4) if is_multi_turn else 2
+            conversation = (
+                await conversation_gen.generate_code_generation_conversation(
+                    generated_code_data=code_data,
+                    persona=persona,
+                    num_turns=num_turns,
+                )
+            )
+            logger.success(f"[{tag}] Generated {len(conversation)} turns")
+        except Exception as e:
+            logger.error(f"[{tag}] Error generating conversation: {e}")
+            return None
+
+        actual_turns = len(conversation) // 2 if len(conversation) % 2 == 0 else (len(conversation) + 1) // 2
+        is_multi_turn = actual_turns > 1
+
+        data_entry = {
+            "conversation": conversation,
+            "metadata": {
+                "sample_index": idx,
+                "conversation_type": "code_generation",
+                "is_multi_turn": is_multi_turn,
+                "persona": persona,
+                "task": code_data["task"],
+                "task_kind": code_data.get("task_kind", task_kind),
+                "generated_code": code_data["code"],
+                "features": code_data.get("features", []),
+                "num_turns": actual_turns,
+            },
+        }
+
+    else:
+        # BUG FIXING SCENARIO
+        example = dataset[idx]
+        original_code = example["code"]
+
+        logger.info(
+            f"[{tag}] Type: Bug Fixing ({'Multi' if is_multi_turn else 'Single'}-turn, {'Multiple' if is_multi_bug else 'Single'} bug)"
+        )
+        logger.info(f"[{tag}] Persona: {persona}, Function: {example['func_name']}")
+
+        # Step 1: Inject bug(s)
+        if is_multi_bug:
+            num_bugs = random.randint(2, 3)
+            logger.info(f"[{tag}] Step 1: Injecting {num_bugs} bugs...")
+            try:
+                bug_data = await bug_injector.inject_multiple_bugs(
+                    original_code, num_bugs=num_bugs
+                )
+
+                if (
+                    bug_data["buggy_code"] == original_code
+                    or bug_data.get("num_bugs", 0) == 0
+                ):
+                    logger.warning(f"[{tag}] Bug injection failed, skipping sample...")
+                    return None
+
+                logger.success(
+                    f"[{tag}] {bug_data.get('num_bugs', num_bugs)} bugs injected"
+                )
+            except Exception as e:
+                logger.error(f"[{tag}] Error injecting bugs: {e}")
+                return None
+        else:
+            logger.info(f"[{tag}] Step 1: Injecting single bug...")
+            try:
+                bug_data = await bug_injector.inject_bug(original_code)
+
+                if (
+                    bug_data["buggy_code"] == original_code
+                    and "Failed" in bug_data["bug_description"]
+                ):
+                    logger.warning(f"[{tag}] Bug injection failed, skipping sample...")
+                    return None
+
+                logger.success(f"[{tag}] Bug injected: {bug_data['bug_category']}")
+            except Exception as e:
+                logger.error(f"[{tag}] Error injecting bug: {e}")
+                return None
+
+        logger.info(f"[{tag}] Step 2: Generating debugging conversation...")
+        try:
+            if is_multi_turn:
+                num_turns = random.randint(2, 6)
+                conversation = await conversation_gen.generate_multi_turn_synthetic(
+                    bug_data=bug_data, persona=persona, num_turns=num_turns
+                )
+            else:
+                conversation = await conversation_gen.generate_single_turn_synthetic(
+                    bug_data=bug_data, persona=persona
+                )
+            logger.success(f"[{tag}] Generated {len(conversation)} turns")
+        except Exception as e:
+            logger.error(f"[{tag}] Error generating conversation: {e}")
+            return None
+
+        actual_turns = len(conversation) // 2 if len(conversation) % 2 == 0 else (len(conversation) + 1) // 2
+        is_multi_turn = actual_turns > 1
+
+        if is_multi_bug:
+            metadata = {
+                "sample_index": idx,
+                "conversation_type": "bug_fixing",
+                "is_multi_turn": is_multi_turn,
+                "is_multi_bug": True,
+                "persona": persona,
+                "original_code": original_code,
+                "buggy_code": bug_data["buggy_code"],
+                "bugs": bug_data.get("bugs", []),
+                "num_bugs": bug_data.get("num_bugs", 0),
+                "all_bug_categories": bug_data.get("all_bug_categories", []),
+                "expected_errors": bug_data.get("expected_errors", ""),
+                "source_repo": example["repo"],
+                "source_path": example["path"],
+                "func_name": example["func_name"],
+                "docstring": example.get("docstring", ""),
+                "num_turns": actual_turns,
+            }
+        else:
+            metadata = {
+                "sample_index": idx,
+                "conversation_type": "bug_fixing",
+                "is_multi_turn": is_multi_turn,
+                "is_multi_bug": False,
+                "persona": persona,
+                "original_code": original_code,
+                "buggy_code": bug_data["buggy_code"],
+                "bug_category": bug_data["bug_category"],
+                "bug_description": bug_data["bug_description"],
+                "expected_error": bug_data["expected_error"],
+                "source_repo": example["repo"],
+                "source_path": example["path"],
+                "func_name": example["func_name"],
+                "docstring": example.get("docstring", ""),
+                "num_turns": actual_turns,
+            }
+
+        data_entry = {"conversation": conversation, "metadata": metadata}
+
+    # --- Validate and score the sample ---
+    conv_type = data_entry["metadata"].get("conversation_type", "")
+    if conv_type == "bug_fixing":
+        is_valid, issues = validate_bug_fixing_sample(data_entry)
+    else:
+        is_valid, issues = validate_code_gen_sample(data_entry)
+
+    quality_score = compute_quality_score(data_entry)
+    data_entry["metadata"]["quality_score"] = round(quality_score, 2)
+    data_entry["metadata"]["validation_passed"] = is_valid
+    data_entry["metadata"]["validation_issues"] = issues
+
+    if not is_valid:
+        logger.warning(f"[{tag}] Validation issues: {issues}")
+
+    return data_entry
+
+
+async def generate_samples(
     n_samples: int = 5,
     dataset_path: str = DEFAULT_DATASET_PATH,
     output_dir: str = "../output",
@@ -43,18 +277,12 @@ def generate_samples(
     code_gen_ratio: float = 0.2,
     multi_bug_ratio: float = 0.4,
     multi_turn_ratio: float = 0.6,
+    save_parquet: bool = True,
 ):
     """
     Generate synthetic TypeScript dataset with multiple conversation types.
 
-    Args:
-        n_samples: Number of samples to generate
-        dataset_path: Path to the source TypeScript dataset
-        output_dir: Directory to save output files
-        resume: Whether to resume from existing samples
-        code_gen_ratio: Ratio of code generation conversations (vs bug fixing)
-        multi_bug_ratio: Ratio of multi-bug samples (vs single bug) in bug fixing
-        multi_turn_ratio: Ratio of multi-turn conversations (vs single turn)
+    Uses async concurrency with a semaphore to run multiple samples in parallel.
     """
     logger.info(f"Loading dataset from {dataset_path}...")
     dataset = load_dataset(dataset_path, split="train")
@@ -64,6 +292,7 @@ def generate_samples(
     logger.info(f"  Code generation ratio: {code_gen_ratio * 100}%")
     logger.info(f"  Multi-bug ratio: {multi_bug_ratio * 100}%")
     logger.info(f"  Multi-turn ratio: {multi_turn_ratio * 100}%")
+    logger.info(f"  Concurrent sessions: {MAX_CONCURRENT_SESSIONS}")
 
     os.makedirs(output_dir, exist_ok=True)
     json_path = os.path.join(output_dir, "dataset_samples.json")
@@ -90,24 +319,13 @@ def generate_samples(
         f"Generating {n_samples} total samples ({len(generated_data)} already done, {n_samples - len(generated_data)} to go)..."
     )
 
-    try:
-        bug_injector = BugInjector()
-        conversation_gen = ConversationGenerator()
-    except Exception as e:
-        logger.error(f"Error initializing components: {e}")
-        logger.error("Please check your .env configuration for correct API keys and URLs.")
-        return generated_data, None
-
     random.seed(42)
     all_indices = list(range(len(dataset)))
     random.shuffle(all_indices)
 
-    sample_indices = []
-    for idx in all_indices:
-        if idx not in completed_indices:
-            sample_indices.append(idx)
-        if len(sample_indices) >= (n_samples - len(generated_data)):
-            break
+    # Collect all available indices (not just n_samples worth) so workers
+    # can backfill when samples fail.
+    available_indices = [idx for idx in all_indices if idx not in completed_indices]
 
     def save_current_state():
         """Save the current generated_data to JSON file (atomic write)."""
@@ -119,7 +337,6 @@ def generate_samples(
             return True
         except Exception as e:
             logger.error(f"Error saving to JSON: {e}")
-            # Clean up tmp file on failure
             if os.path.exists(tmp_path):
                 try:
                     os.remove(tmp_path)
@@ -127,231 +344,83 @@ def generate_samples(
                     pass
             return False
 
-    for idx in tqdm(
-        sample_indices,
-        desc="Generating samples",
-        initial=len(generated_data),
-        total=n_samples,
-    ):
-        try:
-            # Decide conversation type
-            is_code_gen = random.random() < code_gen_ratio
-            is_multi_turn = random.random() < multi_turn_ratio
-            is_multi_bug = (not is_code_gen) and (random.random() < multi_bug_ratio)
+    # Build a queue of (idx, config) for workers to pull from.
+    # Pre-decide types per index so random state is deterministic.
+    work_queue: asyncio.Queue = asyncio.Queue()
+    for idx in available_indices:
+        is_code_gen = random.random() < code_gen_ratio
+        is_multi_turn = random.random() < multi_turn_ratio
+        is_multi_bug = (not is_code_gen) and (random.random() < multi_bug_ratio)
+        persona = random.choice(["beginner", "intermediate", "advanced"])
+        work_queue.put_nowait((idx, is_code_gen, is_multi_turn, is_multi_bug, persona))
 
-            persona = random.choice(["beginner", "intermediate", "advanced"])
+    remaining = n_samples - len(generated_data)
 
-            logger.info("=" * 60)
-            logger.info(
-                f"Processing sample {len(generated_data) + 1}/{n_samples} (index {idx})"
-            )
+    async with OpenCodeServer(port=OPENCODE_PORT) as server:
+        attach_url = f"http://localhost:{OPENCODE_PORT}"
+        bug_injector = BugInjector(attach_url=attach_url)
+        conversation_gen = ConversationGenerator(attach_url=attach_url)
 
-            if is_code_gen:
-                # CODE GENERATION SCENARIO
-                logger.info(
-                    f"Type: Code Generation ({'Multi' if is_multi_turn else 'Single'}-turn)"
-                )
-                logger.info(f"Persona: {persona}")
+        save_lock = asyncio.Lock()
+        progress = tqdm(
+            total=n_samples,
+            initial=len(generated_data),
+            desc="Generating samples",
+        )
 
-                task_kind = random.choice(CODE_GENERATION_TASK_KINDS)
-
-                logger.info("Step 1: Generating TypeScript code...")
-                logger.info(f"Task kind: {task_kind}")
-
+        async def worker():
+            while True:
+                # Check if we already have enough
+                if len(generated_data) >= n_samples:
+                    break
                 try:
-                    code_data = bug_injector.generate_typescript_code(task_kind)
-
-                    if "Failed" in code_data["code"]:
-                        logger.warning("Code generation failed, skipping sample...")
-                        continue
-
-                    logger.success(f"Code generated ({len(code_data['code'])} chars)")
-                    logger.info(f"Task: {code_data['task'][:80]}...")
-                except Exception as e:
-                    logger.error(f"Error generating code: {e}")
-                    continue
-
-                logger.info("Step 2: Generating conversation...")
-                try:
-                    num_turns = random.randint(2, 4) if is_multi_turn else 2
-                    conversation = (
-                        conversation_gen.generate_code_generation_conversation(
-                            generated_code_data=code_data,
-                            persona=persona,
-                            num_turns=num_turns,
-                        )
+                    idx, is_code_gen, is_multi_turn, is_multi_bug, persona = (
+                        work_queue.get_nowait()
                     )
-                    logger.success(f"Generated {len(conversation)} turns")
-                except Exception as e:
-                    logger.error(f"Error generating conversation: {e}")
-                    continue
+                except asyncio.QueueEmpty:
+                    break
 
-                # Recalculate is_multi_turn based on actual conversation length
-                actual_turns = len(conversation) // 2 if len(conversation) % 2 == 0 else (len(conversation) + 1) // 2
-                is_multi_turn = actual_turns > 1
-
-                data_entry = {
-                    "conversation": conversation,
-                    "metadata": {
-                        "sample_index": idx,
-                        "conversation_type": "code_generation",
-                        "is_multi_turn": is_multi_turn,
-                        "persona": persona,
-                        "task": code_data["task"],
-                        "task_kind": code_data.get("task_kind", task_kind),
-                        "generated_code": code_data["code"],
-                        "features": code_data.get("features", []),
-                        "num_turns": len(conversation) // 2
-                        if len(conversation) % 2 == 0
-                        else (len(conversation) + 1) // 2,
-                    },
-                }
-
-            else:
-                # BUG FIXING SCENARIO
-                example = dataset[idx]
-                original_code = example["code"]
-
-                logger.info(
-                    f"Type: Bug Fixing ({'Multi' if is_multi_turn else 'Single'}-turn, {'Multiple' if is_multi_bug else 'Single'} bug)"
+                result = await process_single_sample(
+                    idx=idx,
+                    n_samples=n_samples,
+                    dataset=dataset,
+                    bug_injector=bug_injector,
+                    conversation_gen=conversation_gen,
+                    is_code_gen=is_code_gen,
+                    is_multi_turn=is_multi_turn,
+                    is_multi_bug=is_multi_bug,
+                    persona=persona,
                 )
-                logger.info(f"Persona: {persona}")
-                logger.info(f"Function: {example['func_name']}")
-                logger.info(f"Original code length: {len(original_code)} chars")
 
-                # Step 1: Inject bug(s)
-                if is_multi_bug:
-                    num_bugs = random.randint(2, 3)
-                    logger.info(f"Step 1: Injecting {num_bugs} bugs...")
-                    try:
-                        bug_data = bug_injector.inject_multiple_bugs(
-                            original_code, num_bugs=num_bugs
-                        )
-
-                        if (
-                            bug_data["buggy_code"] == original_code
-                            or bug_data.get("num_bugs", 0) == 0
-                        ):
-                            logger.warning("Bug injection failed, skipping sample...")
-                            continue
-
+                if result is not None:
+                    async with save_lock:
+                        if len(generated_data) >= n_samples:
+                            break
+                        generated_data.append(result)
+                        await asyncio.to_thread(save_current_state)
+                        progress.update(1)
                         logger.success(
-                            f"{bug_data.get('num_bugs', num_bugs)} bugs injected: {', '.join(bug_data.get('all_bug_categories', []))}"
+                            f"Sample {len(generated_data)}/{n_samples} completed "
+                            f"(quality: {result['metadata'].get('quality_score', 0):.2f})"
                         )
-                    except Exception as e:
-                        logger.error(f"Error injecting bugs: {e}")
-                        continue
-                else:
-                    logger.info("Step 1: Injecting single bug...")
-                    try:
-                        bug_data = bug_injector.inject_bug(original_code)
 
-                        if (
-                            bug_data["buggy_code"] == original_code
-                            and "Failed" in bug_data["bug_description"]
-                        ):
-                            logger.warning("Bug injection failed, skipping sample...")
-                            continue
+        workers = [
+            asyncio.create_task(worker())
+            for _ in range(MAX_CONCURRENT_SESSIONS)
+        ]
 
-                        logger.success(f"Bug injected: {bug_data['bug_category']}")
-                    except Exception as e:
-                        logger.error(f"Error injecting bug: {e}")
-                        continue
-
-                logger.info("Step 2: Generating debugging conversation...")
-                try:
-                    if is_multi_turn:
-                        num_turns = random.randint(2, 6)
-                        conversation = conversation_gen.generate_multi_turn_synthetic(
-                            bug_data=bug_data, persona=persona, num_turns=num_turns
-                        )
-                    else:
-                        conversation = conversation_gen.generate_single_turn_synthetic(
-                            bug_data=bug_data, persona=persona
-                        )
-                    logger.success(f"Generated {len(conversation)} turns")
-                except Exception as e:
-                    logger.error(f"Error generating conversation: {e}")
-                    continue
-
-                # Recalculate is_multi_turn based on actual conversation length
-                actual_turns = len(conversation) // 2 if len(conversation) % 2 == 0 else (len(conversation) + 1) // 2
-                is_multi_turn = actual_turns > 1
-
-                # Build metadata based on single vs multiple bugs
-                if is_multi_bug:
-                    metadata = {
-                        "sample_index": idx,
-                        "conversation_type": "bug_fixing",
-                        "is_multi_turn": is_multi_turn,
-                        "is_multi_bug": True,
-                        "persona": persona,
-                        "original_code": original_code,
-                        "buggy_code": bug_data["buggy_code"],
-                        "bugs": bug_data.get("bugs", []),
-                        "num_bugs": bug_data.get("num_bugs", 0),
-                        "all_bug_categories": bug_data.get("all_bug_categories", []),
-                        "expected_errors": bug_data.get("expected_errors", ""),
-                        "source_repo": example["repo"],
-                        "source_path": example["path"],
-                        "func_name": example["func_name"],
-                        "docstring": example.get("docstring", ""),
-                        "num_turns": len(conversation) // 2
-                        if len(conversation) % 2 == 0
-                        else (len(conversation) + 1) // 2,
-                    }
-                else:
-                    metadata = {
-                        "sample_index": idx,
-                        "conversation_type": "bug_fixing",
-                        "is_multi_turn": is_multi_turn,
-                        "is_multi_bug": False,
-                        "persona": persona,
-                        "original_code": original_code,
-                        "buggy_code": bug_data["buggy_code"],
-                        "bug_category": bug_data["bug_category"],
-                        "bug_description": bug_data["bug_description"],
-                        "expected_error": bug_data["expected_error"],
-                        "source_repo": example["repo"],
-                        "source_path": example["path"],
-                        "func_name": example["func_name"],
-                        "docstring": example.get("docstring", ""),
-                        "num_turns": len(conversation) // 2
-                        if len(conversation) % 2 == 0
-                        else (len(conversation) + 1) // 2,
-                    }
-
-                data_entry = {"conversation": conversation, "metadata": metadata}
-
-            # --- Validate and score the sample ---
-            conv_type = data_entry["metadata"].get("conversation_type", "")
-            if conv_type == "bug_fixing":
-                is_valid, issues = validate_bug_fixing_sample(data_entry)
-            else:
-                is_valid, issues = validate_code_gen_sample(data_entry)
-
-            quality_score = compute_quality_score(data_entry)
-            data_entry["metadata"]["quality_score"] = round(quality_score, 2)
-            data_entry["metadata"]["validation_passed"] = is_valid
-            data_entry["metadata"]["validation_issues"] = issues
-
-            if not is_valid:
-                logger.warning(f"Validation issues: {issues}")
-
-            generated_data.append(data_entry)
+        try:
+            await asyncio.gather(*workers)
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            logger.warning("Interrupted! Cancelling remaining workers and saving...")
+            for w in workers:
+                w.cancel()
+            await asyncio.gather(*workers, return_exceptions=True)
             save_current_state()
-            logger.success(
-                f"Sample {len(generated_data)}/{n_samples} completed and saved (quality: {quality_score:.2f})"
-            )
+            progress.close()
+            raise KeyboardInterrupt
 
-        except KeyboardInterrupt:
-            logger.warning("Interrupted by user. Saving progress...")
-            save_current_state()
-            raise
-        except Exception as e:
-            logger.exception(f"Unexpected error processing sample: {e}")
-            save_current_state()
-            continue
+        progress.close()
 
     logger.info("=" * 60)
     logger.info(f"Successfully generated {len(generated_data)} samples")
@@ -402,7 +471,6 @@ def generate_samples(
                     "is_multi_turn": meta.get("is_multi_turn", False),
                     "persona": meta.get("persona", "unknown"),
                     "num_turns": meta.get("num_turns", 0),
-                    # Enriched columns (Phase 3.3)
                     "num_messages": len(conversation),
                     "total_chars": sum(len(m.get("content", "")) for m in conversation),
                     "quality_score": meta.get("quality_score", 0.0),
@@ -446,9 +514,10 @@ def generate_samples(
             df = pd.DataFrame(df_data)
 
             # Save parquet
-            parquet_path = os.path.join(output_dir, "dataset.parquet")
-            df.to_parquet(parquet_path, index=False)
-            logger.info(f"Saved Parquet to: {parquet_path}")
+            if save_parquet:
+                parquet_path = os.path.join(output_dir, "dataset.parquet")
+                df.to_parquet(parquet_path, index=False)
+                logger.info(f"Saved Parquet to: {parquet_path}")
         except Exception as e:
             logger.warning(f"Could not save Parquet: {e}")
             df = None
@@ -468,15 +537,9 @@ def create_train_val_split(
 
     Stratifies on: conversation_type + persona + is_multi_turn.
     Falls back to non-stratified split if any stratum is too small.
-
-    Args:
-        df: DataFrame with generated data
-        output_dir: Directory to save split files
-        val_ratio: Ratio of validation samples
     """
     from sklearn.model_selection import train_test_split
 
-    # Build composite stratification key
     stratify_key = (
         df["conversation_type"].astype(str)
         + "_"
@@ -586,24 +649,22 @@ if __name__ == "__main__":
     logger.info(f"Dataset path: {args.dataset_path}")
     logger.info(f"Parquet generation: {'disabled' if args.no_parquet else 'enabled'}")
     logger.info(f"Resume mode: {'disabled' if args.no_resume else 'enabled'}")
+    logger.info(f"Concurrent sessions: {MAX_CONCURRENT_SESSIONS}")
     logger.info("Progress is saved after each sample. Press Ctrl+C to interrupt safely.")
 
     try:
-        # Generate samples with incremental saving
-        generated_data, df = generate_samples(
-            n_samples=args.samples,
-            dataset_path=args.dataset_path,
-            output_dir=args.output_dir,
-            resume=not args.no_resume,
-            code_gen_ratio=args.code_gen_ratio,
-            multi_bug_ratio=args.multi_bug_ratio,
-            multi_turn_ratio=args.multi_turn_ratio,
+        generated_data, df = asyncio.run(
+            generate_samples(
+                n_samples=args.samples,
+                dataset_path=args.dataset_path,
+                output_dir=args.output_dir,
+                resume=not args.no_resume,
+                code_gen_ratio=args.code_gen_ratio,
+                multi_bug_ratio=args.multi_bug_ratio,
+                multi_turn_ratio=args.multi_turn_ratio,
+                save_parquet=not args.no_parquet,
+            )
         )
-
-        # Optionally skip parquet generation
-        if args.no_parquet and df is not None:
-            logger.warning("Skipping parquet file generation (--no-parquet flag set)")
-            df = None  # Don't use it for splits
 
         # Create train/val split if we have data and a DataFrame
         if df is not None and len(df) > 1:
