@@ -1,0 +1,5 @@
+{
+  "buggyCode": "$executeRawUnsafe(query: string, ...values: RawValue[]): any {\n      return this._createPrismaPromise((transaction) => {\n        checkAlter(this._activeProvider.toLowerCase(), query, values, 'prisma.$executeRawUnsafe(<SQL>, [...values])')\n        return this.$executeRawInternal(transaction, '$executeRawUnsafe', [query, ...values])\n      })\n    }",
+  "bugDescription": "Calling method on possibly null/undefined property: this._activeProvider has type string | null | undefined but .toLowerCase() is called without null check",
+  "expectedError": "Object is possibly 'null' or 'undefined'"
+}

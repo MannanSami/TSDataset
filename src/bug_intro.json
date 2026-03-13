@@ -1,0 +1,5 @@
+{
+  "buggyCode": "public async removeAuthorization (url: string): Promise<AuthUrls> {\n    const entry = this.#authUrls.get(url);\n\n    assert(entry, `The source ${url} is not known`);\n\n    this.#authUrls.delete(url);\n    await this.saveCurrentAuthList();\n\n    if (this.authUrlSubjects[url]) {\n      const updated = { ...entry, authorizedAccounts: [] };\n      this.authUrlSubjects[url].next(updated);\n    }\n\n    return this.authUrls;\n  }",
+  "bugDescription": "TypeScript cannot infer the type of 'entry' after spreading it into a new object, as the optional chaining from Map.get() is lost. The spread operator requires all properties to be defined, but 'entry' is still potentially undefined even after the assert.",
+  "expectedError": "Property 'authorizedAccounts' does not exist on type 'T | undefined'."
+}

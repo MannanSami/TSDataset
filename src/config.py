@@ -1,5 +1,6 @@
 import os
 import re
+import shutil
 from typing import Dict, List
 
 from loguru import logger
@@ -27,11 +28,10 @@ logger.add(
     colorize=True,
 )
 
-# "/media/milab-7/TS_dedup"
-DEFAULT_DATASET_PATH = "/Users/mohammadabdulmannansami/Documents/CM/data"
+DEFAULT_DATASET_PATH = "/media/milab-7/TS_dedup"
 
 # OpenCode configuration
-OPENCODE_PATH = os.getenv("OPENCODE_PATH", "/opt/homebrew/bin/opencode")
+OPENCODE_PATH = os.getenv("OPENCODE_PATH", shutil.which("opencode") or "/home/mitlab-7/.opencode/bin/opencode")
 OPENCODE_PORT = int(os.getenv("OPENCODE_PORT", "14000"))
 OPENCODE_MODEL = os.getenv("OPENCODE_MODEL", "opencode/minimax-m2.5-free")
 MAX_CONCURRENT_SESSIONS = int(os.getenv("MAX_CONCURRENT_SESSIONS", "5"))
