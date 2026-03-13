@@ -319,7 +319,7 @@ async def generate_samples(
         f"Generating {n_samples} total samples ({len(generated_data)} already done, {n_samples - len(generated_data)} to go)..."
     )
 
-    random.seed(42)
+    random.seed()
     all_indices = list(range(len(dataset)))
     random.shuffle(all_indices)
 

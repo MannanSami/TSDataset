@@ -1,0 +1,21 @@
+{
+  "buggyCode": "public texts(limit?: number): ChunkSlice<T>[] {\n    const texts: [ChunkSlice<T>, ...ChunkSlice<T>[]] = [];\n    const txt = this.txt;\n    const overlay = txt.overlay;\n    let cnt = 0;\n    overlay.chunkSlices0(this.start.chunk(), this.start, this.end, (chunk, off, len): [boolean, void] => {\n      if (overlay.isMarker(chunk.id)) return;\n      cnt++;\n      texts.push(new ChunkSlice(chunk, off, len));\n      if (cnt === limit) return true;\n    });\n    return texts;\n  }",
+  "bugs": [
+    {
+      "category": "optional-property",
+      "description": "Parameter 'limit' is declared as optional (?:) but is used in a strict equality comparison without handling the undefined case. When limit is undefined, the expression 'cnt === limit' becomes 'number === number | undefined', which TypeScript flags as an error.",
+      "location": "Function parameter 'limit?: number' and usage in 'cnt === limit' comparison"
+    },
+    {
+      "category": "tuple-type",
+      "description": "Variable 'texts' is typed as a tuple '[ChunkSlice<T>, ...ChunkSlice<T>[]]' instead of an array. Tuples do not have a 'push' method, so calling 'texts.push()' causes a compile-time error.",
+      "location": "Variable declaration 'const texts: [ChunkSlice<T>, ...ChunkSlice<T>[]]' and method call 'texts.push(...)'"
+    },
+    {
+      "category": "interface-mismatch",
+      "description": "The callback function's return type is explicitly annotated as '[boolean, void]' (a tuple type), but the overlay.chunkSlices0 method expects a return type of 'boolean | void'. TypeScript reports that the return type is not assignable to the expected type.",
+      "location": "Callback function return type annotation '(chunk, off, len): [boolean, void]'"
+    }
+  ],
+  "expectedErrors": "TS2365: Operator '===' cannot be applied to types 'number' and 'number | undefined'.; TS2339: Property 'push' does not exist on type '[ChunkSlice<T>, ...ChunkSlice<T>[]]'.; TS2354: Type '[boolean, void]' is not assignable to type 'boolean | void'."
+}
